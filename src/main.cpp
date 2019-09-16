@@ -13,6 +13,18 @@
 WiFiServer wifiServer(5005);
 WiFiClient serverClients[MAX_SRV_CLIENTS];
  
+#define SOFT_SERIAL
+
+#ifdef SOFT_SERIAL 
+#include <SoftwareSerial.h>
+#define SOFT_RX D2
+#define SOFT_TX D1
+
+SoftwareSerial swSerial(SOFT_RX, SOFT_TX);
+#endif
+
+Stream* dpsSerial;
+
 void setup() {
   WiFiManager wifiManager;
 
@@ -23,6 +35,12 @@ void setup() {
 
   Serial.begin(9600);
   Serial.setRxBufferSize(RXBUFFERSIZE);
+ #ifdef SOFT_SERIAL
+  swSerial.begin(9600);
+  dpsSerial = &swSerial;
+#else 
+  dpsSerial = &Serial;
+#endif
  
   wifiServer.begin();
 
@@ -64,18 +82,29 @@ void loop() {
     }
   }
 
+#ifdef SOFT_SERIAL
+  //check USB-Serial for data
+  while (Serial.available()) {
+    byte B = Serial.read();
+    dpsSerial->write(B);
+  }
+#endif
   //check TCP clients for data
   for (int i = 0; i < MAX_SRV_CLIENTS; i++){
     while (serverClients[i].available() && Serial.availableForWrite() > 0) {
       // working char by char is not very efficient
-      Serial.write(serverClients[i].read());
+      dpsSerial->write(serverClients[i].read());
     }
   }
 
   //check UART for data
-  size_t len = Serial.available();
+  size_t len = dpsSerial->available();
   if (len) {
-    byte B = Serial.read();
+    byte B = dpsSerial->read();
+#ifdef SOFT_SERIAL
+    // push to USB-Serial
+    Serial.write(B);
+#endif
     // push UART data to all connected telnet clients
     for (int i = 0; i < MAX_SRV_CLIENTS; i++){
       // if client.availableForWrite() was 0 (congested)
