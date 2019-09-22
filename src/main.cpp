@@ -9,10 +9,33 @@
 #define RXBUFFERSIZE 1024
 #define STACK_PROTECTOR  512 // bytes
 #define HOSTNAME "esp-openDPS"
+
+#define MAX_FRAME_LENGTH 2048
+#define _SOF 0x7e
+#define _DLE 0x7d
+#define _XOR 0x20
+#define _EOF 0x7f
+
+#define DPS_TIMEOUT_SEC 3
+#define DPS_SERIAL Serial
  
 WiFiServer wifiServer(5005);
 WiFiClient serverClients[MAX_SRV_CLIENTS];
- 
+
+enum states {
+  STATE_IDLE,
+  STATE_DPS_WAIT_SOF,
+  STATE_DPS_WAIT_EOF,
+};
+
+int state;
+char client_buf[MAX_FRAME_LENGTH];
+int client_len;
+char dps_buf[MAX_FRAME_LENGTH];
+int dps_len;
+unsigned long dps_timeout;
+Stream* response_stream;
+
 void setup() {
   WiFiManager wifiManager;
 
@@ -21,8 +44,8 @@ void setup() {
   wifiManager.setConfigPortalTimeout(120);
   wifiManager.autoConnect(HOSTNAME);
 
-  Serial.begin(9600);
-  Serial.setRxBufferSize(RXBUFFERSIZE);
+  DPS_SERIAL.begin(9600);
+  DPS_SERIAL.setRxBufferSize(RXBUFFERSIZE);
  
   wifiServer.begin();
 
@@ -33,6 +56,25 @@ void setup() {
   MDNS.addService("opendps", "tcp", 5005);
 
   ESP.wdtDisable();
+
+  state = STATE_IDLE;
+}
+
+int find_chr(char* buf, char ch, int size){
+  for (int i=0; i<size; i++){
+    if (buf[i] == ch){
+      return i;
+    }
+  }
+  return -1;
+}
+
+void send_dps(char* buf, int size, Stream* stream){
+  response_stream = stream;
+  DPS_SERIAL.write(buf, size);
+  dps_len = 0;
+  state = STATE_DPS_WAIT_SOF;
+  dps_timeout = millis() + 1000 * DPS_TIMEOUT_SEC;
 }
 
 void loop() {
@@ -64,27 +106,89 @@ void loop() {
     }
   }
 
-  //check TCP clients for data
-  for (int i = 0; i < MAX_SRV_CLIENTS; i++){
-    while (serverClients[i].available() && Serial.availableForWrite() > 0) {
-      // working char by char is not very efficient
-      Serial.write(serverClients[i].read());
-    }
-  }
-
-  //check UART for data
-  size_t len = Serial.available();
-  if (len) {
-    byte B = Serial.read();
-    // push UART data to all connected telnet clients
-    for (int i = 0; i < MAX_SRV_CLIENTS; i++){
-      // if client.availableForWrite() was 0 (congested)
-      // and increased since then,
-      // ensure write space is sufficient:
-      if (serverClients[i].availableForWrite() >= 1) {
-        serverClients[i].write(B);
+  switch(state){
+    case STATE_IDLE:
+    {
+      //check TCP clients for data
+      for (int i = 0; i < MAX_SRV_CLIENTS; i++){
+        if (serverClients[i].available()){
+          //peek into client buffer
+          client_len = serverClients[i].peekBytes(client_buf, serverClients[i].available());
+          if (client_len < 2){
+            continue;
+          } else {
+            int sof_pos = find_chr(client_buf, _SOF, client_len);
+            if (sof_pos == -1){
+              // garbage found
+              serverClients[i].readBytes(client_buf, client_len);
+              continue;
+            }
+            if (sof_pos > 0){
+              // read garbage on begining and come again
+              serverClients[i].readBytes(client_buf, sof_pos);
+              continue;
+            }
+            int eof_pos = find_chr(client_buf, _EOF, client_len);
+            if (eof_pos == -1)
+              continue;
+            client_len = serverClients[i].readBytesUntil(_EOF, client_buf, MAX_FRAME_LENGTH);
+            // https://github.com/esp8266/Arduino/issues/6546
+            client_buf[client_len++] = _EOF;
+            if (client_buf[client_len-1] != _EOF){
+              //something strange happened
+              serverClients[i].write("uhm");
+              continue;
+            }
+            // write frame to DPS
+            send_dps(client_buf, client_len, &serverClients[i]);
+            break;
+          }
+        }
       }
     }
+    break;
+    case STATE_DPS_WAIT_SOF:
+    {
+      if (millis() > dps_timeout){
+        state = STATE_IDLE;
+        response_stream->write("TIMEOUT");
+        break;
+      }
+      if (!DPS_SERIAL.available())
+        break;
+      dps_buf[0] = DPS_SERIAL.read();
+      if (dps_buf[0] != _SOF){
+        break;
+      }
+      dps_len = 1;
+      state = STATE_DPS_WAIT_EOF;
+    }
+    break;
+    case STATE_DPS_WAIT_EOF:
+    {
+      if (millis() > dps_timeout){
+        state = STATE_IDLE;
+        response_stream->write("TIMEOUT");
+        break;
+      }
+      if (dps_len == MAX_FRAME_LENGTH){
+        //oops EOF not found and max length reached
+        response_stream->write("FRAME TOO LONG");
+        state = STATE_IDLE;
+        break;
+      }
+      if (!DPS_SERIAL.available())
+        break;
+      dps_buf[dps_len++] = DPS_SERIAL.read();
+      if (dps_buf[dps_len-1] != _EOF){
+        break;
+      } else {
+        //EOF was found
+        response_stream->write(dps_buf, dps_len);
+        state = STATE_IDLE;
+        break;
+      }
+    }
+    break;
   }
-
 }
