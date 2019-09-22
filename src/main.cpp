@@ -4,6 +4,7 @@
 #include <ArduinoOTA.h>
 #include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 #include <ESP8266mDNS.h>
+#include <ESP8266WebServer.h>
 
 #define MAX_SRV_CLIENTS 4
 #define RXBUFFERSIZE 1024
@@ -36,12 +37,28 @@
  
 WiFiServer wifiServer(5005);
 WiFiClient serverClients[MAX_SRV_CLIENTS];
+ESP8266WebServer server(80);
 
 enum states {
   STATE_IDLE,
   STATE_DPS_WAIT_SOF,
   STATE_DPS_WAIT_EOF,
 };
+
+int unescape_frame(char* buf, int size){
+  int pos = 0;
+  for (int i=0; i<size; i++){
+    if (buf[i] != _DLE){
+      buf[pos++] = buf[i];
+    } else {
+      i++;
+      buf[pos++] = buf[i] ^ _XOR;
+    }
+  }
+  return pos;
+}
+
+void send_dps(char* buf, int size, Stream* stream);
 
 int state;
 char client_buf[MAX_FRAME_LENGTH];
@@ -50,6 +67,65 @@ char dps_buf[MAX_FRAME_LENGTH];
 int dps_len;
 unsigned long dps_timeout;
 Stream* response_stream;
+
+char* get_next_string(char* buf){
+  int i = 0;
+  while ((buf[i] != '\0')&&(buf[i] != _EOF)){
+    i++;
+  }
+  if (buf[i] == _EOF){
+    return NULL;
+  } else {
+    return &buf[i];
+  }
+}
+
+void dps_query() {
+  char cmd_query[] = { 0x7e, 0x04, 0x40, 0x84, 0x7f};
+  char output[2048];
+
+  send_dps(cmd_query, sizeof(cmd_query), NULL);
+
+  while (state != STATE_IDLE){
+    loop();
+  }
+
+  dps_len = unescape_frame(dps_buf, dps_len);
+
+  #define U16(i) 256*dps_buf[i] + dps_buf[i+1]
+
+  int v_in = U16(3);
+  int v_out = U16(5);
+  int i_out = U16(7);
+  int en = dps_buf[9];
+  int temp1 = U16(10);
+  int temp2 = U16(12);
+  int temp_shutdown = dps_buf[14];
+
+  char *strs[32];
+  strs[0] = &dps_buf[15]; //cur_func
+  int str_cnt=1;
+
+  char params[1024];
+  int params_pos=0;
+
+  //strs[str_cnt] = get_next_string(strs[str_cnt-1]);
+
+  while(strs[str_cnt] = get_next_string(strs[str_cnt-1])){
+    str_cnt++;
+  }
+  str_cnt--;
+  
+/*
+  for (int i=1; i<str_cnt; i+=2){
+    params_pos += sprintf(&params[params_pos], "\t\t\"%s\":\"%s\",\n", strs[i], strs[i+1]);
+  }
+*/
+  sprintf(output, "{\n\t\"v_in\":%d,\n\t\"v_out\":%d,\n\t\"i_out\":%d,\n\t\"output_enabled\":%d,\n\t\"temp_shutdown\":%d,\n\t\"cur_func\":%s,\n\t\"params\":%s\n}", 
+    v_in, v_out, i_out, en, temp_shutdown, strs[0], strs[1]);
+  //server.send_P(200, "text/html", dps_buf, dps_len);
+  server.send(200, "text/html", output);
+}
 
 void setup() {
   WiFiManager wifiManager;
@@ -72,6 +148,9 @@ void setup() {
   //MDNS.begin(HOSTNAME);  // this doesn't work, wifiManager starts mDNS
   MDNS.setHostname(HOSTNAME);
   MDNS.addService("opendps", "tcp", 5005);
+  
+  server.begin();
+  server.on("/query", dps_query);
 
   ESP.wdtDisable();
 
@@ -99,6 +178,8 @@ void loop() {
   ArduinoOTA.handle();
 
   ESP.wdtFeed();
+
+  server.handleClient();
 
   if (WiFi.status() != WL_CONNECTED) {
     ESP.reset();
@@ -218,7 +299,8 @@ void loop() {
         break;
       } else {
         //EOF was found
-        response_stream->write(dps_buf, dps_len);
+        if (response_stream != NULL)
+          response_stream->write(dps_buf, dps_len);
         state = STATE_IDLE;
         break;
       }
