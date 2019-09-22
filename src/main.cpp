@@ -17,7 +17,22 @@
 #define _EOF 0x7f
 
 #define DPS_TIMEOUT_SEC 3
-#define DPS_SERIAL Serial
+
+#define USB_SERIAL Serial
+
+#ifdef USB_SERIAL 
+  #include <SoftwareSerial.h>
+  #define SOFT_RX D2
+  #define SOFT_TX D1
+
+  SoftwareSerial swSerial(SOFT_RX, SOFT_TX);
+  #define DPS_SERIAL swSerial
+
+  char serial_buf[MAX_FRAME_LENGTH];
+  int serial_len;
+#else
+  #define DPS_SERIAL Serial
+#endif
  
 WiFiServer wifiServer(5005);
 WiFiClient serverClients[MAX_SRV_CLIENTS];
@@ -45,7 +60,10 @@ void setup() {
   wifiManager.autoConnect(HOSTNAME);
 
   DPS_SERIAL.begin(9600);
-  DPS_SERIAL.setRxBufferSize(RXBUFFERSIZE);
+
+#ifdef USB_SERIAL
+  USB_SERIAL.begin(9600);
+#endif
  
   wifiServer.begin();
 
@@ -109,6 +127,22 @@ void loop() {
   switch(state){
     case STATE_IDLE:
     {
+#ifdef USB_SERIAL
+      //check for data from USB serial
+      if (USB_SERIAL.available()){
+        if (serial_len == MAX_FRAME_LENGTH){
+          serial_len = 0;
+        }
+        serial_buf[serial_len++] = USB_SERIAL.read();
+        if (serial_buf[0] != _SOF){
+          serial_len = 0;
+        }
+        if (serial_buf[serial_len-1] == _EOF){
+          send_dps(serial_buf, serial_len, &USB_SERIAL);
+          serial_len = 0;
+        }
+      }
+#endif
       //check TCP clients for data
       for (int i = 0; i < MAX_SRV_CLIENTS; i++){
         if (serverClients[i].available()){
