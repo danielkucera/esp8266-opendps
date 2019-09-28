@@ -1,0 +1,86 @@
+<html>
+<head>
+<title>ESP OpenDPS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+#display {
+  background-color: black;
+  color: white;
+  font-family: Ubuntu;
+  width: 150px;
+  text-align: right;
+}
+#case {
+  background-color: #615234;
+  width: min-content;
+  margin: 20px;
+  padding: 20px;
+}
+.a_v_out_block, .a_v_out {
+  font-size: 45px;
+  text-align: right;
+  border: none;
+  background: black;
+  color: white;
+}
+
+.a_v_out {
+  width: 100px;
+}
+</style>
+</head>
+<body>
+<script>
+var xhr = new XMLHttpRequest();
+var url = "/query";
+
+function requestData() {
+  xhr.timeout = 3000;
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState == 4){
+      if (xhr.status == 200) { 
+        updateData(xhr.responseText);
+      }
+      window.setTimeout(requestData, 1000);
+    } 
+  };
+
+  xhr.open("GET", url, true);
+  xhr.send();
+}
+
+function updateData(data) {
+    var jsonData = JSON.parse(data);
+    document.getElementById("json").innerHTML = data;
+    v_out = document.getElementById("v_out");
+    i_out = document.getElementById("i_out");
+    if(jsonData.output_enabled){
+      v_out.value = (jsonData.v_out/1000).toFixed(2);
+      i_out.value = (jsonData.i_out/1000).toFixed(3);
+    } else {
+      if (document.activeElement !== v_out){
+        v_out.value = (jsonData.params.voltage/1000).toFixed(2);
+      }
+      if (document.activeElement !== i_out){
+        i_out.value = (jsonData.params.current/1000).toFixed(3);
+      }
+    }
+    document.getElementById("v_in").innerHTML = (jsonData.v_in/1000).toFixed(2) + 'V';
+}
+
+window.addEventListener("load", requestData);
+
+</script>
+<div id="case">
+  <div id="display">
+    <div class="a_v_out_block">
+        <input type="number" step="0.01" class="a_v_out" id="v_out"/><span>V</span><br>
+        <input type="number" step="0.01" class="a_v_out" id="i_out"/><span>A</span><br>    
+    </div>
+    <div id="statusbar"><span id="v_in"></span></div>
+  </div>
+</div>
+<pre id="json">
+</pre>
+</body>
+</html>

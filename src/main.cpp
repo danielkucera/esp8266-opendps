@@ -5,6 +5,7 @@
 #include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 #include <ESP8266mDNS.h>
 #include <ESP8266WebServer.h>
+#include <FS.h>
 
 #define MAX_SRV_CLIENTS 4
 #define RXBUFFERSIZE 1024
@@ -39,11 +40,28 @@ WiFiServer wifiServer(5005);
 WiFiClient serverClients[MAX_SRV_CLIENTS];
 ESP8266WebServer server(80);
 
+String getContentType(String filename); // convert the file extension to the MIME type
+bool handleFileRead(String path);       // send the right file to the client (if it exists)
+
 enum states {
   STATE_IDLE,
   STATE_DPS_WAIT_SOF,
   STATE_DPS_WAIT_EOF,
 };
+
+char cmd_query[] = { 0x7e, 0x04, 0x40, 0x84, 0x7f };
+
+#define U16(i) 256*dps_buf[i] + dps_buf[i+1]
+
+void send_dps(char* buf, int size, Stream* stream);
+
+int state;
+char client_buf[MAX_FRAME_LENGTH];
+int client_len;
+char dps_buf[MAX_FRAME_LENGTH];
+int dps_len;
+unsigned long dps_timeout;
+Stream* response_stream;
 
 int unescape_frame(char* buf, int size){
   int pos = 0;
@@ -58,41 +76,23 @@ int unescape_frame(char* buf, int size){
   return pos;
 }
 
-void send_dps(char* buf, int size, Stream* stream);
-
-int state;
-char client_buf[MAX_FRAME_LENGTH];
-int client_len;
-char dps_buf[MAX_FRAME_LENGTH];
-int dps_len;
-unsigned long dps_timeout;
-Stream* response_stream;
-
-char* get_next_string(char* buf){
-  int i = 0;
-  while ((buf[i] != '\0')&&(buf[i] != _EOF)){
-    i++;
-  }
-  if (buf[i] == _EOF){
-    return NULL;
-  } else {
-    return &buf[i];
-  }
-}
-
-void dps_query() {
-  char cmd_query[] = { 0x7e, 0x04, 0x40, 0x84, 0x7f};
-  char output[2048];
-
+void request_dps(char* cmd, int cmd_len){
   send_dps(cmd_query, sizeof(cmd_query), NULL);
 
   while (state != STATE_IDLE){
     loop();
   }
-
   dps_len = unescape_frame(dps_buf, dps_len);
+}
 
-  #define U16(i) 256*dps_buf[i] + dps_buf[i+1]
+void dps_query() {
+  char output[1024];
+  char params[1024];
+  char* strs[32];
+  int str_cnt=0;
+  int params_pos=0;
+
+  request_dps(cmd_query, sizeof(cmd_query));
 
   int v_in = U16(3);
   int v_out = U16(5);
@@ -102,29 +102,28 @@ void dps_query() {
   int temp2 = U16(12);
   int temp_shutdown = dps_buf[14];
 
-  char *strs[32];
-  strs[0] = &dps_buf[15]; //cur_func
-  int str_cnt=1;
+  strs[str_cnt++] = &dps_buf[15]; //cur_func
 
-  char params[1024];
-  int params_pos=0;
-
-  //strs[str_cnt] = get_next_string(strs[str_cnt-1]);
-
-  while(strs[str_cnt] = get_next_string(strs[str_cnt-1])){
-    str_cnt++;
+  for (int i=15; i<dps_len; i++){
+    if (dps_buf[i] == '\0'){
+      strs[str_cnt++] = &dps_buf[i+1];
+    }
+    if (dps_buf[i] == _EOF){
+      break;
+    }
   }
   str_cnt--;
-  
-/*
-  for (int i=1; i<str_cnt; i+=2){
+
+  for (int i=1; i<str_cnt-1; i+=2){
     params_pos += sprintf(&params[params_pos], "\t\t\"%s\":\"%s\",\n", strs[i], strs[i+1]);
   }
-*/
-  sprintf(output, "{\n\t\"v_in\":%d,\n\t\"v_out\":%d,\n\t\"i_out\":%d,\n\t\"output_enabled\":%d,\n\t\"temp_shutdown\":%d,\n\t\"cur_func\":%s,\n\t\"params\":%s\n}", 
-    v_in, v_out, i_out, en, temp_shutdown, strs[0], strs[1]);
-  //server.send_P(200, "text/html", dps_buf, dps_len);
-  server.send(200, "text/html", output);
+  params[params_pos-2]=' '; // remove last comma
+
+  sprintf(output, "{\n\t\"v_in\":%d,\n\t\"v_out\":%d,\n\t\"i_out\":%d,\n\t\"output_enabled\":%d,\n\t\"temp_shutdown\""
+    ":%d,\n\t\"cur_func\":\"%s\",\n\t\"params\": {\n%s\t}\n}", v_in, v_out, i_out, en, temp_shutdown, strs[0], params);
+
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  server.send(200, "application/json", output);
 }
 
 void setup() {
@@ -145,16 +144,43 @@ void setup() {
 
   ArduinoOTA.begin();
 
+  SPIFFS.begin();
+
   //MDNS.begin(HOSTNAME);  // this doesn't work, wifiManager starts mDNS
   MDNS.setHostname(HOSTNAME);
   MDNS.addService("opendps", "tcp", 5005);
   
   server.begin();
   server.on("/query", dps_query);
+  server.onNotFound([]() {                              // If the client requests any URI
+    if (!handleFileRead(server.uri()))                  // send it if it exists
+      server.send(404, "text/plain", "404: Not Found"); // otherwise, respond with a 404 (Not Found) error
+  });
 
   ESP.wdtDisable();
 
   state = STATE_IDLE;
+}
+
+
+String getContentType(String filename) { // convert the file extension to the MIME type
+  if (filename.endsWith(".html")) return "text/html";
+  else if (filename.endsWith(".css")) return "text/css";
+  else if (filename.endsWith(".js")) return "application/javascript";
+  else if (filename.endsWith(".ico")) return "image/x-icon";
+  return "text/plain";
+}
+
+bool handleFileRead(String path) { // send the right file to the client (if it exists)
+  if (path.endsWith("/")) path += "index.html";         // If a folder is requested, send the index file
+  String contentType = getContentType(path);            // Get the MIME type
+  if (SPIFFS.exists(path)) {                            // If the file exists
+    File file = SPIFFS.open(path, "r");                 // Open it
+    size_t sent = server.streamFile(file, contentType); // And send it to the client
+    file.close();                                       // Then close the file again
+    return true;
+  }
+  return false;                                         // If the file doesn't exist, return false
 }
 
 int find_chr(char* buf, char ch, int size){
@@ -208,6 +234,9 @@ void loop() {
   switch(state){
     case STATE_IDLE:
     {
+      // we don't expect data from DPS, trash them
+      if (DPS_SERIAL.available())
+        Serial.read();
 #ifdef USB_SERIAL
       //check for data from USB serial
       if (USB_SERIAL.available()){
